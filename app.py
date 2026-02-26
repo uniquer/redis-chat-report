@@ -6,35 +6,36 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import io
+import plotly.graph_objects as go
 
 # Load environment variables
 load_dotenv()
 
-# Redis Configuration
-REDIS_URL = os.getenv("REDIS_URL", None)
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_USERNAME = os.getenv("REDIS_USERNAME", "default")
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
-REDIS_SSL = os.getenv("REDIS_SSL", "False").lower() == "true"
-
-def connect_redis():
+def connect_redis(env="Dev"):
+    env_suffix = f"_{env.upper()}"
+    redis_url = os.getenv(f"REDIS_URL{env_suffix}", None)
+    redis_host = os.getenv(f"REDIS_HOST{env_suffix}", "localhost")
+    redis_port = int(os.getenv(f"REDIS_PORT{env_suffix}", 6379))
+    redis_username = os.getenv(f"REDIS_USERNAME{env_suffix}", "default")
+    redis_password = os.getenv(f"REDIS_PASSWORD{env_suffix}", None)
+    redis_ssl = os.getenv(f"REDIS_SSL{env_suffix}", "False").lower() == "true"
+    
     try:
-        if REDIS_URL:
-            r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        if redis_url:
+            r = redis.Redis.from_url(redis_url, decode_responses=True)
         else:
             r = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                username=REDIS_USERNAME,
-                password=REDIS_PASSWORD,
-                ssl=REDIS_SSL,
+                host=redis_host,
+                port=redis_port,
+                username=redis_username,
+                password=redis_password,
+                ssl=redis_ssl,
                 decode_responses=True
             )
         r.ping()
         return r
     except Exception as e:
-        st.error(f"Failed to connect to Redis: {e}")
+        st.error(f"Failed to connect to Redis {env}: {e}")
         return None
 
 def fetch_chat_data(r):
@@ -72,6 +73,23 @@ def fetch_chat_data(r):
                 if role == "user":
                     current_user_msg = {"query": content, "timestamp": timestamp}
                 elif role == "assistant" and current_user_msg:
+                    # Extract relatedQuestion and feedback from assistant message
+                    related_q = msg.get("relatedQuestion")
+                    if isinstance(related_q, dict):
+                        rq_str = "\n".join([str(v) for v in related_q.values() if v])
+                    else:
+                        rq_str = str(related_q) if related_q else None
+                        
+                    feedback = msg.get("feedback") or {}
+                    if isinstance(feedback, dict):
+                        f_action = feedback.get("action")
+                        f_remark = feedback.get("remark")
+                        f_comment = feedback.get("comment")
+                    else:
+                        f_action = None
+                        f_remark = None
+                        f_comment = None
+
                     # Found a pair
                     all_data.append({
                         "User ID": user_id,
@@ -79,6 +97,10 @@ def fetch_chat_data(r):
                         "Timestamp": current_user_msg["timestamp"],
                         "Query (User)": current_user_msg["query"],
                         "Response (AI)": content,
+                        "Related Questions": rq_str,
+                        "Action": f_action,
+                        "Remark": f_remark,
+                        "Comment": f_comment,
                         "Key": key
                     })
                     current_user_msg = None # Reset for next pair
@@ -88,48 +110,155 @@ def fetch_chat_data(r):
             
     return pd.DataFrame(all_data)
 
+@st.cache_data(ttl=60) # Cache the raw fetched data for 60 seconds to avoid unnecessary Redis calls
+def get_cached_chat_data(env="Dev"):
+    r = connect_redis(env)
+    if not r:
+        return pd.DataFrame()
+    return fetch_chat_data(r)
+
 def main():
     st.set_page_config(page_title="Redis Chat Report", layout="wide")
     st.title("📊 Redis Chat Report Exporter")
     
     # Sidebar for Refresh and Info
     with st.sidebar:
-        st.info(f"Connected to: {REDIS_HOST}:{REDIS_PORT}")
-        if st.button("🔄 Refresh Data"):
+        default_env = os.getenv("REDIS_ENV", "Dev")
+        env_index = 0 if default_env.lower() == "dev" else 1
+        
+        selected_env = st.selectbox("Environment", ["Dev", "Prod"], index=env_index)
+        st.info(f"Status: Connected to {selected_env}")
+        
+        if st.button("🔄 Force Refresh Data"):
+            get_cached_chat_data.clear() # Clear cache on explicit refresh
             st.rerun()
 
-    r = connect_redis()
-    if not r:
-        st.stop()
-
-    with st.spinner("Fetching data from Redis..."):
-        df = fetch_chat_data(r)
+    with st.spinner(f"Fetching data from {selected_env} Redis..."):
+        df = get_cached_chat_data(selected_env)
 
     if df.empty:
         st.warning("No chat data found in Redis.")
         return
 
-    # Convert timestamp to datetime for filtering
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+    # Convert timestamp to datetime for filtering and charting
+    # Handling both timezone-aware (Z) and timezone-naive strings seamlessly
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], format='ISO8601', utc=True, errors='coerce')
     df = df.sort_values(by='Timestamp', ascending=False)
-
-    # Filtering UI
-    st.subheader("Filters")
-    col1, col2 = st.columns(2)
     
-    with col1:
-        min_date = df['Timestamp'].min().date()
-        max_date = df['Timestamp'].max().date()
-        start_date = st.date_input("Start Date", min_date)
-        
-    with col2:
-        end_date = st.date_input("End Date", max_date)
+    # Initialize session state for filters if not present
+    if 'filter_start_date' not in st.session_state:
+        st.session_state.filter_start_date = df['Timestamp'].min().date()
+    if 'filter_end_date' not in st.session_state:
+        st.session_state.filter_end_date = df['Timestamp'].max().date()
+    if 'filter_actions' not in st.session_state:
+        st.session_state.filter_actions = []
 
-    # Apply filters
-    mask = (df['Timestamp'].dt.date >= start_date) & (df['Timestamp'].dt.date <= end_date)
+    s_date = st.session_state.filter_start_date
+    e_date = st.session_state.filter_end_date
+    acts = st.session_state.filter_actions
+
+    # 1. Base filtered dataframe (Applies to both Dashboard and Table)
+    mask = (df['Timestamp'].dt.date >= s_date) & (df['Timestamp'].dt.date <= e_date)
+    if acts and 'Action' in df.columns:
+        mask &= df['Action'].isin(acts)
+        
     filtered_df = df.loc[mask].copy()
 
-    # Display Data
+    # 2. Prepare Dashboard Data from filtered_df
+    dash_df = filtered_df.copy()
+    # Explicitly convert to standard YYYY-MM-DD string to prevent continuous/timezone axis bugs
+    dash_df['Date'] = dash_df['Timestamp'].dt.strftime('%Y-%m-%d')
+    grouped = dash_df.groupby('Date').agg(
+        Queries=('Key', 'count'),
+        Likes=('Action', lambda x: (x == 'like').sum()),
+        Dislikes=('Action', lambda x: (x == 'dislike').sum())
+    ).reset_index()
+
+    st.subheader("Dashboard Overview")
+    
+    fig = go.Figure()
+    # 0 = Bar (Queries)
+    fig.add_trace(go.Bar(x=grouped['Date'], y=grouped['Queries'], name='Total Queries', marker_color='#3b82f6'))
+    # 1 = Scatter (Likes)
+    fig.add_trace(go.Scatter(x=grouped['Date'], y=grouped['Likes'], mode='markers', name='Likes', marker=dict(size=12, color='#22c55e')))
+    # 2 = Scatter (Dislikes)
+    fig.add_trace(go.Scatter(x=grouped['Date'], y=grouped['Dislikes'], mode='markers', name='Dislikes', marker=dict(size=12, color='#ef4444')))
+
+    fig.update_layout(
+        title="Queries, Likes, and Dislikes over Time",
+        xaxis_title="Date",
+        yaxis_title="Count",
+        xaxis=dict(
+            type='category',
+            tickformat='%d %b %Y'
+        ),
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=40, b=20),
+        height=400,
+        clickmode='event+select'
+    )
+
+    # Render interactive Plotly chart
+    event = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
+    
+    # 3. Process chart selections
+    if event and 'selection' in event and 'points' in event['selection'] and len(event['selection']['points']) > 0:
+        point = event['selection']['points'][0]
+        selected_chart_date = pd.to_datetime(point['x']).date()
+        trace_id = point['curve_number']
+        
+        # Determine if Like (1) or Dislike (2) was clicked
+        if trace_id == 1:
+            selected_chart_action = ['like']
+        elif trace_id == 2:
+            selected_chart_action = ['dislike']
+        else:
+            selected_chart_action = []
+
+        # Check if a rerun is needed to prevent infinite loops from Streamlit components
+        needs_rerun = False
+        if st.session_state.filter_start_date != selected_chart_date or st.session_state.filter_end_date != selected_chart_date:
+            st.session_state.filter_start_date = selected_chart_date
+            st.session_state.filter_end_date = selected_chart_date
+            needs_rerun = True
+            
+        if set(st.session_state.filter_actions) != set(selected_chart_action):
+            st.session_state.filter_actions = selected_chart_action
+            needs_rerun = True
+            
+        if needs_rerun:
+            st.rerun()
+
+    # 4. Filtering UI (Bound directly to session state, auto updates on change)
+    st.subheader("Filters")
+    col1, col2, col3, col4 = st.columns([2, 2, 4, 1])
+    
+    with col1:
+        st.date_input("Start Date", key="filter_start_date")
+        
+    with col2:
+        st.date_input("End Date", key="filter_end_date")
+        
+    with col3:
+        unique_actions = sorted(df['Action'].dropna().unique().tolist()) if 'Action' in df.columns else []
+        st.multiselect("Filter by Action ('like', 'dislike', etc.)", options=unique_actions, key="filter_actions")
+
+    def reset_filters(min_d, max_d):
+        st.session_state.filter_start_date = min_d
+        st.session_state.filter_end_date = max_d
+        st.session_state.filter_actions = []
+
+    with col4:
+        st.write("") # Spacing
+        st.write("")
+        st.button(
+            "Reset Filters", 
+            use_container_width=True, 
+            on_click=reset_filters, 
+            args=(df['Timestamp'].min().date(), df['Timestamp'].max().date())
+        )
+
+    # 5. Display Data
     st.subheader(f"Results ({len(filtered_df)} chats)")
     
     # Format timestamp for display
