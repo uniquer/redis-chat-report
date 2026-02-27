@@ -229,34 +229,40 @@ def main():
         if needs_rerun:
             st.rerun()
 
-    # 4. Filtering UI (Bound directly to session state, auto updates on change)
+    # 4. Filtering UI
     st.subheader("Filters")
-    col1, col2, col3, col4 = st.columns([2, 2, 4, 1])
-    
-    with col1:
-        st.date_input("Start Date", key="filter_start_date")
+    with st.form("filters_form"):
+        col1, col2, col3, col4, col5 = st.columns([2, 2, 3, 1.5, 1.5])
         
-    with col2:
-        st.date_input("End Date", key="filter_end_date")
-        
-    with col3:
-        unique_actions = sorted(df['Action'].dropna().unique().tolist()) if 'Action' in df.columns else []
-        st.multiselect("Filter by Action ('like', 'dislike', etc.)", options=unique_actions, key="filter_actions")
+        with col1:
+            st.date_input("Start Date", key="filter_start_date")
+            
+        with col2:
+            st.date_input("End Date", key="filter_end_date")
+            
+        with col3:
+            unique_actions = sorted(df['Action'].dropna().unique().tolist()) if 'Action' in df.columns else []
+            st.multiselect("Filter by Action ('like', 'dislike', etc.)", options=unique_actions, key="filter_actions")
 
-    def reset_filters(min_d, max_d):
-        st.session_state.filter_start_date = min_d
-        st.session_state.filter_end_date = max_d
-        st.session_state.filter_actions = []
+        def reset_filters(min_d, max_d):
+            st.session_state.filter_start_date = min_d
+            st.session_state.filter_end_date = max_d
+            st.session_state.filter_actions = []
 
-    with col4:
-        st.write("") # Spacing
-        st.write("")
-        st.button(
-            "Reset Filters", 
-            use_container_width=True, 
-            on_click=reset_filters, 
-            args=(df['Timestamp'].min().date(), df['Timestamp'].max().date())
-        )
+        with col4:
+            st.write("") # Spacing
+            st.write("")
+            st.form_submit_button("Apply Filter", use_container_width=True)
+
+        with col5:
+            st.write("") # Spacing
+            st.write("")
+            st.form_submit_button(
+                "Reset Filter", 
+                use_container_width=True, 
+                on_click=reset_filters, 
+                args=(df['Timestamp'].min().date(), df['Timestamp'].max().date())
+            )
 
     # 5. Display Data
     st.subheader(f"Results ({len(filtered_df)} chats)")
